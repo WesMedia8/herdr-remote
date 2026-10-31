@@ -100,3 +100,10 @@ direct APNsClient; otherwise there is no push client or watcher. The watcher pol
 `live_terminals()` from the shared agents provider, seeds statuses silently,
 and stops/joins before transport shutdown. Relay credentials, APNs setup and
 notification timing are documented in [README.md](README.md).
+
+## Chat history and folders when herdr runs on Windows
+
+When the bridge runs in WSL and `hc` / `herdr_app` point at the Windows `.exe` files, the bridge treats Windows as the host:
+
+- `/api/dirs` browses the Windows home drive and returns Windows paths (`C:\Users\you\...`), translated with `wslpath` both ways. `/api/new` accepts either form and always hands herdr a Windows path. Windows' legacy junction folders (My Documents, Application Data, ...) are hidden.
+- `/api/chat` reads transcripts from the Windows user's `.claude` / `.codex` folders. **Claude Code** terminals are matched exactly: the bridge walks the terminal's process tree (via PowerShell under WSL, `ps` elsewhere) and reads Claude's `~/.claude/sessions/<pid>.json` for the session id. **Codex** terminals are matched by the rollout whose `session_meta` started in the same folder after that Codex process started (and before any later Codex process). A mapped agent that hasn't been sent a message yet returns `{"messages": []}`. Text the agents inject themselves (environment context, system reminders) is left out.

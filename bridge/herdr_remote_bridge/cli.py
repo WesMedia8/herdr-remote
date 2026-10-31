@@ -15,7 +15,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 
 from . import server
-from .herd_push import RelayConfig, register_bridge
+from .herd_push import RelayConfig, RelayClient, register_bridge
 
 
 DEFAULT_RELAY_URL = "https://herdr-remote-relay-production.up.railway.app"
@@ -98,21 +98,44 @@ def bridge_running(host, port):
         return False
 
 
-def wait_for_phone(directory, token, timeout=600):
+def wait_for_phone(directory, token, timeout=600, relay_client=None, baseline=None):
     """Wait until the bridge reports a request made with this token (see Runtime.note_paired)."""
     marker = Path(directory) / 'herd-paired.json'
     fingerprint = server.token_fingerprint(token)
     print('Scan the code with your iPhone camera. Waiting for Herdr Remote to connect... (Ctrl+C to stop)')
     deadline = time.time() + timeout
+    connected = False
+    notification_deadline = None
+    next_poll = 0
     while time.time() < deadline:
         try:
             info = json.loads(marker.read_text(encoding='utf-8'))
             if info.get('token') == fingerprint:
-                where = f" from {info['from']}" if info.get('from') else ''
-                print(f'✓ Herdr Remote connected{where}. You\'re all set.')
-                return True
+                if not connected:
+                    print('✓ Herdr Remote connected')
+                    connected = True
+                    notification_deadline = time.time() + 60
+                    deadline = max(deadline, notification_deadline + 1)
+                if relay_client is None:
+                    return True
         except (OSError, ValueError):
             pass
+        if relay_client is not None and time.time() >= next_poll:
+            next_poll = time.time() + 2
+            try:
+                status = relay_client.status()
+                if baseline is not None and (
+                    (status.get('last_registered_at') or 0) > (baseline.get('last_registered_at') or 0)
+                    or any(status.get('devices', {}).get(k, 0) > baseline.get('devices', {}).get(k, 0)
+                           for k in ('alert', 'activity', 'start'))):
+                    if connected:
+                        print('✓ Notifications on')
+                        return True
+            except Exception:
+                pass
+        if connected and time.time() >= notification_deadline:
+            print("Connected, but the phone hasn't turned on notifications yet — open Herdr Remote and allow notifications.")
+            return False
         time.sleep(1)
     print('No phone connected yet. Run pair again whenever you\'re ready.')
     return False
@@ -174,16 +197,25 @@ def pair(relay_url=None, new_token=False, wait=True, open_image=True, no_relay=F
     if new_token:
         print('New token made: phones paired before need to scan this code again.')
     (path.parent / 'herd-paired.json').unlink(missing_ok=True)
+    relay_client = RelayClient(relay) if relay and wait else None
+    baseline = None
+    if relay_client:
+        try:
+            baseline = relay_client.status()
+        except Exception:
+            print('Warning: unable to check relay registration; notification success cannot be verified.')
     image = show_qr(build_pair_url(host, port, token, name, relay), path.parent, open_image)
     try:
         if not bridge_running(host, port):
             print(f'Heads up: the bridge isn\'t running on {host}:{port}, so the phone can\'t connect yet.')
             print('Start it in another window with: herdr-remote-bridge serve  (or: herdr-remote-bridge service install)')
         if wait:
-            wait_for_phone(path.parent, token)
+            wait_for_phone(path.parent, token, relay_client=relay_client, baseline=baseline)
     except KeyboardInterrupt:
         print()
     finally:
+        if relay_client:
+            relay_client.close()
         if image:
             try:
                 image.unlink(missing_ok=True)

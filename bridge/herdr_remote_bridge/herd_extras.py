@@ -30,6 +30,18 @@ def _tool(name, args):
     return f'{name}({str(args)[:240]})'
 
 
+# Text the agents add to the conversation themselves, which the person never typed.
+_INJECTED = ('<environment_context>', '<user_instructions>', '<permissions instructions>',
+             '<system-reminder>', '<local-command-caveat>', '# AGENTS.md instructions')
+
+
+def _injected(entry, role, texts):
+    if entry.get('isMeta'):  # Claude: caveats and other bookkeeping
+        return True
+    joined = '\n'.join(texts).lstrip()
+    return role == 'user' and joined.startswith(_INJECTED)
+
+
 def parse_transcript(path, since=None):
     messages = []
     with Path(path).open(encoding='utf-8', errors='replace') as stream:
@@ -63,6 +75,8 @@ def parse_transcript(path, since=None):
                     texts.append(block['text'])
                 elif block.get('type') == 'tool_use':
                     tools.append(_tool(block.get('name', 'Tool'), block.get('input', {})))
+            if _injected(entry, role, texts):
+                continue
             identity = str(entry.get('uuid') or entry.get('id') or msg.get('id') or
                            hashlib.sha256((str(index) + ':' + line).encode()).hexdigest()[:24])
             for suffix, item_role, text in [('text', role, '\n'.join(texts))] + [(f'tool-{i}', 'tool', t) for i, t in enumerate(tools)]:
@@ -226,7 +240,11 @@ def validated_dir(value=None, root=None):
 def handle_dirs(data, root=None):
     try:
         path, root = validated_dir(data.get('path'), root)
-        hidden = {'appdata', 'windows', 'program files', 'program files (x86)', 'programdata', '$recycle.bin', 'system volume information', 'recovery'}
+        hidden = {'appdata', 'windows', 'program files', 'program files (x86)', 'programdata', '$recycle.bin', 'system volume information', 'recovery',
+                  # Windows' legacy compatibility junctions in a user folder (they point back into the profile).
+                  'application data', 'cookies', 'local settings', 'my documents', 'nethood', 'printhood', 'recent',
+                  'sendto', 'start menu', 'templates', 'my music', 'my pictures', 'my videos', 'documents and settings',
+                  'all users', 'default user'}
         dirs = []
         for item in path.iterdir():
             if item.name.startswith('.') or item.name.lower() in hidden:

@@ -399,7 +399,10 @@ class RelayConfig:
     @classmethod
     def load(cls, directory=None):
         path = (Path(directory) if directory else caller_dir()) / 'herd-relay.json'
-        return cls(**json.loads(path.read_text(encoding='utf-8')))
+        config = cls(**json.loads(path.read_text(encoding='utf-8')))
+        if os.name == 'posix':
+            path.chmod(0o600)
+        return config
 
 
 def register_bridge(relay_url, name=None, directory=None, client=None):
@@ -435,6 +438,13 @@ class RelayClient:
             import httpx
             client = httpx.Client(timeout=15)
         self.client = client
+
+    def status(self):
+        response = self.client.get(self.config.relay_url.rstrip('/') + '/v1/bridges/status',
+            headers={'Authorization': 'Bearer ' + self.config.bridge_secret,
+                     'X-Bridge-Id': self.config.bridge_id})
+        response.raise_for_status()
+        return response.json()
 
     def _post(self, payload):
         try:

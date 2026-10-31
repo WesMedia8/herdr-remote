@@ -42,6 +42,93 @@ class ServerTests(unittest.TestCase):
         head, payload = sock.output.getvalue().split(b'\r\n\r\n', 1)
         return int(head.split()[1]), json.loads(payload)
 
+    def test_pairing_lazy_reload_and_auth(self):
+        self.addCleanup(self.runtime.close)
+        self.assertEqual(self.request('GET', '/api/pairing', token='secret', auth='Bearer secret'),
+                         (404, {'error': 'no relay'}))
+        with patch.object(server, 'RelayClient') as client, patch.object(server, 'StatusWatcher') as watcher:
+            client.return_value.is_relay = True
+            watcher.return_value.ident = None
+            config = RelayConfig('https://relay.example', 'id', 'hidden', 'code')
+            client.return_value.config = config
+            cli.save_private(self.root / 'herd-relay.json', config.__dict__)
+            self.assertEqual(self.request('GET', '/api/pairing', token='secret')[0], 401)
+            self.assertEqual(self.request('GET', '/api/pairing', token='secret', auth='Bearer secret'),
+                             (200, {'relay': config.relay_url, 'bridge': 'id', 'pair': 'code'}))
+            self.runtime.start()
+            watcher.return_value.start.assert_called_once()
+            config.pair_code = 'replacement'
+            cli.save_private(self.root / 'herd-relay.json', config.__dict__)
+            self.runtime.reload_relay()
+            self.assertEqual(client.call_count, 2)
+            watcher.return_value.stop.assert_called_once()
+            client.return_value.close.assert_called_once()
+            self.assertEqual(watcher.return_value.start.call_count, 2)
+            (self.root / 'herd-relay.json').write_text('{partial')
+            self.runtime.reload_relay()
+            self.assertEqual(client.call_count, 2)
+            if os.name == 'posix':
+                self.assertEqual((self.root / 'herd-relay.json').stat().st_mode & 0o777, 0o600)
+
+    def test_pair_wait_requires_phone_and_new_relay_registration(self):
+        marker = self.root / 'herd-paired.json'
+        baseline = {'devices': {'alert': 1}, 'last_registered_at': 10}
+        newer = {'devices': {'alert': 1}, 'last_registered_at': 11}
+        relay = Mock()
+        ticks = [0]
+        def now(): return ticks[0]
+        def sleep(seconds):
+            ticks[0] += seconds
+            if ticks[0] == 3:
+                marker.write_text(json.dumps({'token': server.token_fingerprint('secret')}))
+        relay.status.return_value = newer
+        with patch.object(cli.time, 'time', side_effect=now), patch.object(cli.time, 'sleep', side_effect=sleep), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertTrue(cli.wait_for_phone(self.root, 'secret', timeout=100, relay_client=relay, baseline=baseline))
+            self.assertGreaterEqual(ticks[0], 3)
+            self.assertIn('✓ Notifications on', output.getvalue())
+        relay.status.return_value = baseline
+        ticks[0] = 0
+        with patch.object(cli.time, 'time', side_effect=now), patch.object(cli.time, 'sleep', side_effect=sleep), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertFalse(cli.wait_for_phone(self.root, 'secret', timeout=100, relay_client=relay, baseline=baseline))
+            self.assertNotIn('✓ Notifications on', output.getvalue())
+            self.assertIn("hasn't turned on notifications yet", output.getvalue())
+            self.assertEqual(ticks[0], 60)
+
+    def test_pair_captures_baseline_before_qr_and_closes_client(self):
+        path = self.root / 'config.json'
+        path.write_text('{"host":"127.0.0.1","token":"test"}')
+        config = RelayConfig('https://relay.example', 'id', 'secret', 'code')
+        baseline = {'devices': {'alert': 0}, 'last_registered_at': None}
+        events = []
+        with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), \
+             patch.object(cli, 'register_bridge', return_value=config), \
+             patch.object(cli, 'RelayClient') as client, \
+             patch.object(cli, 'show_qr', side_effect=lambda *a: events.append('qr')), \
+             patch.object(cli, 'bridge_running', return_value=True), \
+             patch.object(cli, 'wait_for_phone', return_value=True) as wait, \
+             patch('sys.stdout', new_callable=io.StringIO):
+            def status():
+                events.append('status')
+                return baseline
+            client.return_value.status.side_effect = status
+            cli.pair()
+            self.assertEqual(events, ['status', 'qr'])
+            wait.assert_called_once_with(self.root, 'test', relay_client=client.return_value, baseline=baseline)
+            client.return_value.close.assert_called_once()
+
+    def test_relay_client_status(self):
+        from bridge.herdr_remote_bridge.herd_push import RelayClient
+        transport = Mock()
+        transport.get.return_value.json.return_value = {'devices': {'alert': 2}, 'last_registered_at': 12}
+        config = RelayConfig('https://relay.example/', 'id', 'secret', 'code')
+        client = RelayClient(config, client=transport)
+        self.assertEqual(client.status()['devices']['alert'], 2)
+        transport.get.assert_called_once_with('https://relay.example/v1/bridges/status',
+            headers={'Authorization': 'Bearer secret', 'X-Bridge-Id': 'id'})
+        transport.get.return_value.raise_for_status.assert_called_once()
+
     def test_auth_required_optional_and_unknown_routes(self):
         with patch.object(server, 'agents_snapshot', return_value={'terminals': [], 'extra': True}):
             self.assertEqual(self.request('GET', '/api/agents')[0], 200)

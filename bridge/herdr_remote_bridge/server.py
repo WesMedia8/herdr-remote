@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from .herd_push import (PushConfig, TokenStore, APNsClient, RelayConfig, RelayClient,
                         StatusWatcher, handle_register, handle_activity, handle_test_push)
 from .herd_extras import SpaceStore, handle_chat, handle_upload, handle_dirs, handle_space
+from . import sessions
 
 
 def config_path():
@@ -203,10 +204,93 @@ def app_spaces():
 
 def dir_exists(path):
     """True when the folder exists. Windows paths (C:\\x) are checked through wslpath under WSL."""
-    if re.match(r"^[A-Za-z]:[\\/]", path) and shutil.which("wslpath"):
-        r = subprocess.run(["wslpath", "-u", path], capture_output=True, text=True)
-        return r.returncode == 0 and os.path.isdir(r.stdout.strip())
+    if WINDOWS_PATH.match(path) and (windows_host() or shutil.which("wslpath")):
+        try:
+            return os.path.isdir(wslpath(path, "u"))
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            return False
     return os.path.isabs(path) and os.path.isdir(path)
+
+
+WINDOWS_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_WINDOWS_HOME = []
+
+
+def windows_host():
+    """True when this bridge runs in WSL but drives herdr on Windows (hc/herdr-app are .exe)."""
+    return sessions.is_wsl() and any(str(p).lower().endswith(".exe") for p in (HC, HERDR_APP))
+
+
+def wslpath(path, to):
+    """Translate between Windows and WSL paths: to='u' gives /mnt/c/..., to='w' gives C:\\..."""
+    r = subprocess.run(["wslpath", "-" + to, str(path)], capture_output=True, text=True, timeout=10)
+    if r.returncode or not r.stdout.strip():
+        raise ValueError("path translation failed")
+    return r.stdout.strip()
+
+
+def windows_home():
+    """The Windows user's home (C:\\Users\\name): config `home` if it's a Windows path, else %USERPROFILE%."""
+    if HOME and WINDOWS_PATH.match(HOME):
+        return HOME
+    if not _WINDOWS_HOME:
+        out = subprocess.run(["cmd.exe", "/d", "/c", "echo %USERPROFILE%"], capture_output=True, text=True,
+                             timeout=10, cwd="/mnt/c" if os.path.isdir("/mnt/c") else None).stdout.strip()
+        if not WINDOWS_PATH.match(out):
+            raise ValueError("Windows home not found; set home in config.json")
+        _WINDOWS_HOME.append(out)
+    return _WINDOWS_HOME[0]
+
+
+def agent_home():
+    """Home folder whose .claude/.codex hold the agents' transcripts (the Windows one under WSL)."""
+    return Path(wslpath(windows_home(), "u")) if windows_host() else Path.home()
+
+
+def windows_dirs(query):
+    """/api/dirs over the Windows home drive, in Windows paths, for a bridge running in WSL."""
+    try:
+        home = wslpath(windows_home(), "u")
+        value = (query.get("path") or "").strip()
+        linux = value if value.startswith("/") else wslpath(value or windows_home(), "u")
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return 400, {"error": "folder unavailable or outside browse root"}
+    parts = Path(home).parts  # ('/', 'mnt', 'c', 'Users', ...)
+    root = str(Path(*parts[:3])) if len(parts) >= 3 and parts[1] == "mnt" else "/"
+    status, result = handle_dirs({"path": linux}, root=root)
+    if status == 200:
+        result["path"] = wslpath(result["path"], "w")
+        if result.get("parent"):
+            result["parent"] = wslpath(result["parent"], "w")
+    return status, result
+
+
+def terminal_info(t):
+    code, out, err = hc("get", t, "--json")
+    if code:
+        raise RuntimeError(err.strip() or "hc get failed")
+    return json.loads(out)
+
+
+def chat_source(t, term):
+    """Where terminal t's transcript lives: {'session_id'|'session_file', 'cwd', 'home'} or None.
+    Claude: exact, via ~/.claude/sessions/<pid>.json under the terminal's process tree.
+    Codex: the rollout that began in the terminal's folder after its codex process started."""
+    agent = term.get("agent")
+    if agent not in ("claude-code", "codex"):
+        return None
+    info = terminal_info(t)
+    roots = [info.get("pid"), (info.get("foreground") or {}).get("pid")]
+    home = agent_home()
+    procs = sessions.processes(windows_host())
+    if agent == "claude-code":
+        found = sessions.claude_session(roots, home, procs)
+        if found:
+            return {"session_id": found["sessionId"], "cwd": found.get("cwd") or term.get("cwd"), "home": home}
+        return None
+    local = (lambda p: wslpath(p, "u") if WINDOWS_PATH.match(str(p)) else p) if windows_host() else None
+    path = sessions.codex_rollout(roots, home, term.get("cwd"), procs, local)
+    return {"session_file": str(path), "cwd": term.get("cwd"), "home": home} if path else None
 
 
 def agents_snapshot():
@@ -234,6 +318,37 @@ class Runtime:
         self.watcher = (StatusWatcher(get_terminals or live_terminals, self.client, self.tokens, self.machine)
                         if self.client else None)
         self._paired = None
+        self._relay_mtime = self._relay_stamp()
+        self._runtime_lock = threading.RLock()
+        self._started = False
+        self._get_terminals = get_terminals or live_terminals
+
+    def _relay_stamp(self):
+        try:
+            stat = (self.directory / 'herd-relay.json').stat()
+            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except FileNotFoundError:
+            return None
+
+    def reload_relay(self):
+        with self._runtime_lock:
+            stamp = self._relay_stamp()
+            if stamp == self._relay_mtime:
+                return
+            try:
+                config = RelayConfig.load(self.directory) if stamp else None
+            except (OSError, ValueError, TypeError):
+                return  # A partial write must not replace a working client.
+            client = (RelayClient(config, machine=self.machine) if config else
+                      APNsClient(PushConfig.load(self.directory), self.tokens)
+                      if (self.directory / 'herd-push.json').exists() else None)
+            self._close_push()
+            self.client = client
+            self.watcher = (StatusWatcher(self._get_terminals, client, self.tokens, self.machine)
+                            if client else None)
+            self._relay_mtime = stamp
+            if self._started and self.watcher:
+                self.watcher.start()
 
     def note_paired(self, token, client_ip):
         """Record that a phone used this token, so `pair` can say it connected.
@@ -250,10 +365,16 @@ class Runtime:
             pass
 
     def start(self):
-        if self.watcher:
+        self._started = True
+        self.reload_relay()
+        if self.watcher and self.watcher.ident is None:
             self.watcher.start()
 
     def close(self):
+        self._started = False
+        self._close_push()
+
+    def _close_push(self):
         if self.watcher:
             self.watcher.stop()
             if self.watcher.ident is not None:
@@ -307,6 +428,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.runtime
 
     def _authorized(self):
+        self.runtime.reload_relay()
         token = current_token()
         if urlparse(self.path).path.startswith('/api/') and token:
             supplied = self.headers.get('Authorization', '')
@@ -334,6 +456,15 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/":
             return self._json(200, {"app": "herd-phone", "ok": True})
+        if url.path == '/api/pairing':
+            client = self.runtime.client
+            if not getattr(client, 'is_relay', False):
+                return self._json(404, {'error': 'no relay'})
+            if not current_token():
+                return self._json(401, {'error': 'unauthorized'})
+            config = client.config
+            return self._json(200, {'relay': config.relay_url, 'bridge': config.bridge_id,
+                                    'pair': config.pair_code})
         if url.path == "/api/agents":
             try:
                 return self._json(200, agents_snapshot())
@@ -341,7 +472,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(502, {'error': str(exc)})
         query = {k: v[-1] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
         if url.path == '/api/dirs':
-            return self._json(*handle_dirs(query))
+            return self._json(*(windows_dirs(query) if windows_host() else handle_dirs(query)))
         if url.path == '/api/chat':
             t = query.get('t', '')
             if not ADDRESS.fullmatch(t):
@@ -351,10 +482,22 @@ class Handler(BaseHTTPRequestHandler):
             if not term:
                 return self._json(404, {'error': 'terminal not found'})
             if not term.get('session_file') and not term.get('session_id'):
+                try:
+                    source = chat_source(t, term)
+                except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+                    source = None
+                if source:
+                    status, result = handle_chat(query, agent=term.get('agent'), cwd=source.get('cwd'),
+                                                 session_file=source.get('session_file'),
+                                                 session_id=source.get('session_id'), home=source['home'])
+                    if status == 404:  # mapped, but nothing said yet: Claude writes the file on the first message
+                        status, result = 200, {'messages': []}
+                    return self._json(status, result)
                 if not term.get('cwd') or sum(x.get('cwd') == term.get('cwd') for x in terminals) > 1:
                     return self._json(400, {'error': 'terminal session mapping required'})
             return self._json(*handle_chat(query, agent=term.get('agent'), cwd=term.get('cwd'),
-                                          session_file=term.get('session_file'), session_id=term.get('session_id')))
+                                          session_file=term.get('session_file'), session_id=term.get('session_id'),
+                                          home=agent_home()))
         if url.path == "/api/read":
             t = parse_qs(url.query).get("t", [""])[0]
             if not ADDRESS.fullmatch(t):
@@ -390,6 +533,8 @@ class Handler(BaseHTTPRequestHandler):
         cwd = (cwd or "").strip()
         if cwd and not dir_exists(cwd):
             return self._json(400, {"error": "folder not found"})
+        if cwd and cwd.startswith("/") and windows_host():
+            cwd = wslpath(cwd, "w")  # herdr on Windows needs C:\... paths
         with NEW_LOCK:
             try:
                 spaces = app_spaces()
@@ -562,6 +707,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
 
+class BridgeHTTPServer(ThreadingHTTPServer):
+    def service_actions(self):
+        # Also notice relay configuration changes while no phones are making requests.
+        self.runtime.reload_relay()
+
+
 def serve():
     if not HOST:
         raise SystemExit('No Tailscale address found. Start Tailscale or configure host.')
@@ -570,7 +721,7 @@ def serve():
     print(f'Config: {config_path()}')
     runtime = Runtime()
     try:
-        with ThreadingHTTPServer((HOST, PORT), Handler) as httpd:
+        with BridgeHTTPServer((HOST, PORT), Handler) as httpd:
             httpd.runtime = runtime
             runtime.start()
             print(f'Herdr Remote bridge on http://{HOST}:{PORT}')
