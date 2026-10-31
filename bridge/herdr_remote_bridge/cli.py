@@ -18,6 +18,8 @@ from . import server
 from .herd_push import RelayConfig, register_bridge
 
 
+DEFAULT_RELAY_URL = "https://herdr-remote-relay-production.up.railway.app"
+
 def save_private(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,7 +118,7 @@ def wait_for_phone(directory, token, timeout=600):
     return False
 
 
-def pair(relay_url=None, new_token=False, wait=True, open_image=True):
+def pair(relay_url=None, new_token=False, wait=True, open_image=True, no_relay=False):
     cfg = server.load_config()
     host = cfg.get('host') or server.tailscale_ip()
     if not host:
@@ -130,23 +132,30 @@ def pair(relay_url=None, new_token=False, wait=True, open_image=True):
     name = socket.gethostname()
     relay_path = path.parent / 'herd-relay.json'
     relay = None
-    if relay_path.exists():
-        relay = RelayConfig.load(path.parent)
-        if relay_url and relay_url.rstrip('/') != relay.relay_url.rstrip('/'):
-            raise ValueError('Existing relay differs; use a separate HERD_CONFIG directory for another bridge.')
+    relay_url = relay_url or os.environ.get('HERD_RELAY_URL')
+    if not no_relay:
         import httpx
-        with httpx.Client(timeout=10) as client:
-            result = client.post(relay.relay_url.rstrip('/') + '/v1/bridges/rotate-pair',
-                                 headers={'Authorization': 'Bearer ' + relay.bridge_secret,
-                                          'X-Bridge-Id': relay.bridge_id})
-            result.raise_for_status()
-            relay.pair_code = result.json()['pair_code']
-        save_private(relay_path, relay.__dict__)
-    elif relay_url:
-        parsed = urlsplit(relay_url)
-        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError('Relay URL must be HTTPS without credentials.')
-        relay = register_bridge(relay_url, name, path.parent)
+        try:
+            if relay_path.exists():
+                relay = RelayConfig.load(path.parent)
+                if relay_url and relay_url.rstrip('/') != relay.relay_url.rstrip('/'):
+                    raise ValueError('Existing relay differs; use a separate HERD_CONFIG directory for another bridge.')
+                with httpx.Client(timeout=10) as client:
+                    result = client.post(relay.relay_url.rstrip('/') + '/v1/bridges/rotate-pair',
+                                         headers={'Authorization': 'Bearer ' + relay.bridge_secret,
+                                                  'X-Bridge-Id': relay.bridge_id})
+                    result.raise_for_status()
+                    relay.pair_code = result.json()['pair_code']
+                save_private(relay_path, relay.__dict__)
+            else:
+                relay_url = relay_url or DEFAULT_RELAY_URL
+                parsed = urlsplit(relay_url)
+                if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+                    raise ValueError('Relay URL must be HTTPS without credentials.')
+                relay = register_bridge(relay_url, name, path.parent)
+        except httpx.RequestError:
+            relay = None
+            print('Warning: relay unavailable; continuing with local-only pairing (no push).')
     port = int(cfg.get('port') or 8787)
     try:
         sys.stdout.reconfigure(line_buffering=True)  # show progress at once, even when piped
@@ -182,7 +191,7 @@ def pair(relay_url=None, new_token=False, wait=True, open_image=True):
                 print(f'Delete {image} when you\'re done: it contains your bridge token.')
 
 
-def doctor():
+def doctor(relay_url=None):
     cfg = server.load_config()
     print(f'Config: {server.config_path()}')
     checks = []
@@ -216,7 +225,9 @@ def doctor():
     check(server.config_path().is_file(), 'config.json present', 'Run herdr-remote-bridge pair.')
     check(cfg.get('token'), 'API token configured', 'Run herdr-remote-bridge pair.')
     relay_path = server.config_path().parent / 'herd-relay.json'
-    relay_url = RelayConfig.load(relay_path.parent).relay_url if relay_path.exists() else os.environ.get('HERD_RELAY_URL')
+    relay_url = (relay_url or os.environ.get('HERD_RELAY_URL')
+                 or (RelayConfig.load(relay_path.parent).relay_url if relay_path.exists() else None)
+                 or DEFAULT_RELAY_URL)
     if relay_url:
         try:
             with urlopen(relay_url.rstrip('/') + '/healthz', timeout=5) as response:
@@ -236,11 +247,14 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command')
     commands.add_parser('serve', help='Run the bridge (default)')
     pairing = commands.add_parser('pair', help='Create token and print pairing QR; rotates existing relay pair code')
-    pairing.add_argument('--relay', default=os.environ.get('HERD_RELAY_URL'), metavar='URL')
+    relay_options = pairing.add_mutually_exclusive_group()
+    relay_options.add_argument('--relay', metavar='URL')
+    relay_options.add_argument('--no-relay', action='store_true', help='Pair locally without relay push notifications')
     pairing.add_argument('--new-token', action='store_true', help='Replace the token (phones must scan again)')
     pairing.add_argument('--no-wait', action='store_true', help="Don't wait for the phone to connect")
     pairing.add_argument('--no-open', action='store_true', help="Only print the QR; don't open it as an image")
-    commands.add_parser('doctor', help='Check local prerequisites and configuration')
+    diagnostics = commands.add_parser('doctor', help='Check local prerequisites and configuration')
+    diagnostics.add_argument('--relay', metavar='URL')
     service = commands.add_parser('service', help='Manage per-user startup')
     service.add_argument('action', choices=['install', 'uninstall', 'status'])
     args = parser.parse_args(argv)
@@ -249,9 +263,9 @@ def main(argv=None):
             from .service import manage
             return manage(args.action)
         elif args.command == 'pair':
-            pair(args.relay, new_token=args.new_token, wait=not args.no_wait, open_image=not args.no_open)
+            pair(args.relay, new_token=args.new_token, wait=not args.no_wait, open_image=not args.no_open, no_relay=args.no_relay)
         elif args.command == 'doctor':
-            return doctor()
+            return doctor(args.relay)
         else:
             server.serve()
     except Exception:

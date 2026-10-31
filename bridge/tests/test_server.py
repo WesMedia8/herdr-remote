@@ -159,11 +159,66 @@ class ServerTests(unittest.TestCase):
              patch.dict('sys.modules', {'httpx': httpx}), patch.object(cli, 'show_qr', return_value=None) as qr, patch.object(cli, 'bridge_running', return_value=True):
             cli.pair('https://relay.example', wait=False)
             registration.assert_called_once()
-            cli.pair('https://relay.example', wait=False)
+            cli.pair(wait=False)
             self.assertEqual(registration.call_count, 1)
             self.assertEqual(RelayConfig.load(self.root).pair_code, 'replacement')
             self.assertIn('pair=replacement', qr.call_args.args[0])
             self.assertNotIn('secret', qr.call_args.args[0])
+
+    def test_pair_relay_defaults_overrides_opt_out_and_network_fallback(self):
+        import httpx
+        path = self.root / 'config.json'
+        path.write_text('{"host":"127.0.0.1"}')
+        relay = RelayConfig(cli.DEFAULT_RELAY_URL, 'id', 'secret', 'code')
+        with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), \
+             patch.object(cli, 'register_bridge', return_value=relay) as register, \
+             patch.object(cli, 'show_qr', return_value=None) as qr, \
+             patch.object(cli, 'bridge_running', return_value=True), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            cli.main(['pair', '--no-wait', '--no-open'])
+            self.assertEqual(register.call_args.args[0], cli.DEFAULT_RELAY_URL)
+            self.assertIn('relay=', qr.call_args.args[0])
+            with patch.dict('os.environ', {'HERD_RELAY_URL': 'https://custom.example'}):
+                cli.pair(wait=False)
+                self.assertEqual(register.call_args.args[0], 'https://custom.example')
+                cli.pair('https://explicit.example', wait=False)
+                self.assertEqual(register.call_args.args[0], 'https://explicit.example')
+                register.reset_mock()
+                cli.save_private(self.root / 'herd-relay.json', relay.__dict__)
+                cli.main(['pair', '--no-relay', '--no-wait', '--no-open'])
+                register.assert_not_called()
+                self.assertNotIn('relay=', qr.call_args.args[0])
+                (self.root / 'herd-relay.json').unlink()
+            for error in (httpx.ConnectError('private detail'), httpx.ReadTimeout('private detail')):
+                register.side_effect = error
+                cli.pair(wait=False)
+                self.assertNotIn('relay=', qr.call_args.args[0])
+                self.assertTrue(json.loads(path.read_text())['token'])
+                self.assertFalse((self.root / 'herd-relay.json').exists())
+            self.assertEqual(output.getvalue().count('Warning: relay unavailable;'), 2)
+            self.assertNotIn('private detail', output.getvalue())
+
+    def test_doctor_relay_default_and_precedence(self):
+        path = self.root / 'config.json'
+        path.write_text('{"host":"127.0.0.1","token":"test"}')
+        with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), \
+             patch.object(cli, 'urlopen') as request, \
+             patch.object(cli.socket, 'create_connection'), \
+             patch.object(server, 'detect_tailscale', return_value=('127.0.0.1', 'mock')), \
+             patch.object(cli.shutil, 'which', return_value='/mock/tool'), \
+             patch('sys.stdout', new_callable=io.StringIO):
+            request.return_value.__enter__.return_value.status = 200
+            cli.doctor()
+            request.assert_called_with(cli.DEFAULT_RELAY_URL + '/healthz', timeout=5)
+            cli.save_private(self.root / 'herd-relay.json',
+                             RelayConfig('https://saved.example', 'id', 'secret', 'code').__dict__)
+            cli.doctor()
+            request.assert_called_with('https://saved.example/healthz', timeout=5)
+            with patch.dict('os.environ', {'HERD_RELAY_URL': 'https://env.example'}):
+                cli.doctor()
+                request.assert_called_with('https://env.example/healthz', timeout=5)
+                cli.main(['doctor', '--relay', 'https://explicit.example'])
+                request.assert_called_with('https://explicit.example/healthz', timeout=5)
 
     def test_pair_url_and_qr_fallback(self):
         relay = RelayConfig('https://relay.example', 'id', 'NEVER-IN-QR', 'p&?')
@@ -186,9 +241,9 @@ class ServerTests(unittest.TestCase):
         path = self.root / 'config.json'
         path.write_text('{"host":"127.0.0.1","port":9999}')
         with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), patch.object(cli, 'show_qr', return_value=None) as qr, patch.object(cli, 'bridge_running', return_value=True):
-            cli.pair(wait=False)
+            cli.pair(wait=False, no_relay=True)
             first = json.loads(path.read_text())
-            cli.pair(wait=False)
+            cli.pair(wait=False, no_relay=True)
             self.assertEqual(json.loads(path.read_text()), first)
             self.assertEqual(first['port'], 9999)
             self.assertTrue(first['token'])
@@ -199,9 +254,9 @@ class ServerTests(unittest.TestCase):
         path.write_text('{"host":"127.0.0.1","token":"old"}')
         with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), \
              patch.object(cli, 'show_qr', return_value=None), patch.object(cli, 'bridge_running', return_value=True):
-            cli.pair(wait=False)
+            cli.pair(wait=False, no_relay=True)
             self.assertEqual(json.loads(path.read_text())['token'], 'old')
-            cli.pair(new_token=True, wait=False)
+            cli.pair(new_token=True, wait=False, no_relay=True)
             self.assertNotEqual(json.loads(path.read_text())['token'], 'old')
 
     def test_pair_deletes_qr_image_holding_token(self):
@@ -214,7 +269,7 @@ class ServerTests(unittest.TestCase):
         with patch.dict('os.environ', {'HERD_CONFIG': str(path)}, clear=True), \
              patch.object(cli, 'show_qr', side_effect=fake_show), patch.object(cli, 'bridge_running', return_value=True), \
              patch('sys.stdout', new_callable=io.StringIO):
-            cli.pair(wait=False)
+            cli.pair(wait=False, no_relay=True)
         self.assertFalse(image.exists())
 
     def test_bridge_records_phone_and_pair_sees_it(self):

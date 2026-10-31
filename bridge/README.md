@@ -87,13 +87,21 @@ See [config.example.json](config.example.json). Use absolute executable paths fo
 
 ### Push notifications
 
-To use a shared relay without an Apple key on this computer:
+Push notifications work automatically through the Herdr Remote relay when you pair.
+Only device push tokens and hashed secrets are stored there; see the
+[relay privacy policy](https://herdr-remote-relay-production.up.railway.app/privacy).
+Use `herdr-remote-bridge pair --no-relay` to opt out and pair locally without relay push.
+Network failures during relay setup fall back to local-only pairing with a warning.
 
-```sh
-herdr-remote-bridge pair --relay https://<relay-host>
-```
-
-`HERD_RELAY_URL` supplies the default relay. The first call registers this computer and creates private `herd-relay.json`; later pair calls rotate its pair code and save the replacement. Existing phone registrations remain active; scan the new QR for future pairing. A different relay requires a separate config directory. A remote registration/rotation can succeed before a local save fails; inspect local state before retrying after a storage failure.
+`--relay URL` or `HERD_RELAY_URL` overrides the official relay. Otherwise pairing
+uses an existing `herd-relay.json`, then defaults to
+`https://herdr-remote-relay-production.up.railway.app`. The first call registers this
+computer and creates private `herd-relay.json`; later pair calls rotate its pair
+code and save the replacement. Existing phone registrations remain active;
+`--no-relay` skips relay setup for this pairing and leaves existing registrations
+and configuration intact. Scan the new QR for future pairing. A different relay
+requires a separate config directory. A remote registration/rotation can succeed
+before a local save fails; inspect local state before retrying after a storage failure.
 
 The QR includes `url`, `token`, hostname `name` and, when configured, `relay`, `bridge`, `pair`. It never includes the bridge secret. The hostname is also the watcher's machine name, so activity registration must use that exact name. Restart serve after pairing/config changes.
 
