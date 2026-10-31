@@ -4,7 +4,11 @@ The bridge connects the **Herdr Remote** iPhone app to herdr agents (Claude Code
 
 > Herdr Remote is an independent project and is not affiliated with herdr.
 
-## Install
+## Get the app
+
+Join the iPhone beta on TestFlight: https://testflight.apple.com/join/EdbkSmNd
+
+## Install the bridge
 
 1. Install [Tailscale](https://tailscale.com/download) on your computer **and** your iPhone, and sign in to the same account.
 2. Run the installer on the computer where herdr runs:
