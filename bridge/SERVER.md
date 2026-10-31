@@ -26,6 +26,8 @@ JSON returns 400. Storage failures return 500 with a sanitized error.
 |---|---|---|---|
 | GET | `/api/agents` | none | full `hc ls --json` object |
 | GET | `/api/read` | `?t=t7` | `{"text":"..."}`, 300 lines with ANSI removed |
+| POST | `/api/close` | `{"t":"t7"}` | `{"ok":true,"closed":"tab"}` (or `pane`, `terminal`) |
+| POST | `/api/space/close` | `{"space":"Project"}` | `{"ok":true,"closed_terminals":2}` |
 | POST | `/api/send` | `{"t":"t7","text":"hello"}` | `{"ok":true}` |
 | POST | `/api/keys` | `{"t":"t7","key":"enter"}` | `{"ok":true}` |
 | GET | `/api/spaces` | none | `{"spaces":[{"name":"Project","cwd":"/path/to/project"}]}` |
@@ -39,6 +41,16 @@ Terminal addresses match `^t[0-9a-z]{1,8}$`. Send uses hc JSON-RPC without a
 caller and removes inherited HC_TERMINAL_ID from the child environment. Empty
 text is rejected. Keys: enter, esc, tab, up, down, left, right, ctrl+c, y, n,
 1, 2, 3, space, backspace.
+
+Close operations serialize with agent/project creation. A sole terminal closes its
+whole tab (`tab.close`, confirmed); a split closes its pane (`pane.close`). A live
+hc-only terminal uses `terminal.kill`, followed by best-effort `hc rm`. Unknown
+terminals return 404; invalid addresses return 400; herdr-app failures return 502
+with its error. Read also returns 404 when a terminal is no longer live.
+Project close matches live names or aliases case-insensitively, calls
+`space.close` with confirmation, and removes matching saved project defaults.
+Unknown projects return 404. The count is the number of terminals in its tabs.
+All close routes require the same bearer authentication as other API routes.
 
 New agents accept `claude-code`, `codex`, or `sh`. The default creates a new
 space, suffixing a number if the name is already live. Only `same_space:true`

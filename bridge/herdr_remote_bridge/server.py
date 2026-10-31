@@ -359,6 +359,8 @@ class Handler(BaseHTTPRequestHandler):
             t = parse_qs(url.query).get("t", [""])[0]
             if not ADDRESS.fullmatch(t):
                 return self._json(400, {"error": "bad terminal"})
+            if not any(x["address"] == t for x in live_terminals()):
+                return self._json(404, {"error": "terminal not found"})
             code, out, err = hc("read", t, "--lines", "300")
             if code:
                 return self._json(502, {"error": err.strip() or "hc read failed"})
@@ -437,6 +439,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(502, {"error": str(e)})
         return self._json(504, {"error": "started, but the new terminal didn't show up"})
 
+    def _close(self, body, project=False):
+        value = body.get('space' if project else 't', '')
+        if not isinstance(value, str) or not value.strip() or (not project and not ADDRESS.fullmatch(value)):
+            return self._json(400, {'error': 'space required' if project else 'bad terminal'})
+        with NEW_LOCK:
+            try:
+                spaces = app_spaces()
+                if project:
+                    found = next((s for s in spaces if value.strip().casefold() in
+                                  {a.casefold() for a in s['aliases']}), None)
+                    if not found:
+                        return self._json(404, {'error': 'space not found'})
+                    command, args = 'space.close', {'id': found['id'], 'confirmed': True}
+                    count = sum(len(tab.get('terminals', [])) for tab in found.get('tabs', []))
+                else:
+                    match = next(((tab, term) for space in spaces for tab in space.get('tabs', [])
+                                  for term in tab.get('terminals', []) if term.get('terminal') == value), None)
+                    if match:
+                        tab, term = match
+                        if len(tab['terminals']) == 1:
+                            command, args = 'tab.close', {'id': tab['id'], 'confirmed': True}
+                        else:
+                            command, args = 'pane.close', {'pane': term['pane']}
+                    elif any(t['address'] == value for t in live_terminals()):
+                        command, args = 'terminal.kill', {'terminal': value}
+                    else:
+                        return self._json(404, {'error': 'terminal not found'})
+                code, out, err = app('do', command, json.dumps(args))
+                if code:
+                    return self._json(502, {'error': (err or out).strip() or 'herdr-app failed'})
+                if project:
+                    self.runtime.spaces.remove(found['aliases'])
+                    return self._json(200, {'ok': True, 'closed_terminals': count})
+                if command == 'terminal.kill':
+                    try:
+                        hc('rm', value)
+                    except Exception:
+                        pass
+                return self._json(200, {'ok': True, 'closed': command.split('.')[0]})
+            except Exception as exc:
+                return self._json(502, {'error': str(exc)})
+
     def do_POST(self):
         try:
             self._post()
@@ -452,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urlparse(self.path)
         if url.path not in ("/api/send", "/api/keys", "/api/new", "/api/register", "/api/activity",
-                            "/api/test-push", "/api/upload", "/api/space"):
+                            "/api/test-push", "/api/upload", "/api/space", "/api/close", "/api/space/close"):
             return self._json(404, {"error": "not found"})
         try:
             if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length') is None:
@@ -468,6 +512,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "bad json"})
         if not isinstance(body, dict):
             return self._json(400, {"error": "bad json"})
+        if url.path in ('/api/close', '/api/space/close'):
+            return self._close(body, project=url.path == '/api/space/close')
         if url.path == '/api/register':
             return self._json(*handle_register(body, self.runtime.tokens))
         if url.path == '/api/activity':

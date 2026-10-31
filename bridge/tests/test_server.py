@@ -55,6 +55,40 @@ class ServerTests(unittest.TestCase):
                                  ('POST', '/api/space/'), ('GET', '/api/nope')]:
                 self.assertEqual(self.request(method, path), (404, {'error': 'not found'}))
 
+    def test_close_routes(self):
+        fixture = {'spaces': [{'id': 's1', 'name': 'Synthetic', 'folder': '/tmp', 'tabs': [
+            {'id': 'tab1', 'name': 'Solo', 'terminals': [{'terminal': 't1', 'pane': 'p1', 'status': 'idle', 'app': 'sh'}]},
+            {'id': 'tab2', 'name': 'Split', 'terminals': [{'terminal': 't2', 'pane': 'p2'}, {'terminal': 't3', 'pane': 'p3'}]}
+        ]}, {'id': 'remote', 'name': 'Remote', 'machine': 'win-native', 'tabs': []}]}
+        def invoke(*args):
+            return (0, json.dumps(fixture), '') if args == ('ls',) else (0, '{}', '')
+        with patch.object(server, 'app', side_effect=invoke) as app, patch.object(server, 'live_terminals', return_value=[
+                {'address': 't1', 'where': 'Alias / Solo'}, {'address': 't4'}]), patch.object(server, 'hc', side_effect=OSError) as hc:
+            for terminal, command, args, closed in [
+                ('t1', 'tab.close', {'id': 'tab1', 'confirmed': True}, 'tab'),
+                ('t2', 'pane.close', {'pane': 'p2'}, 'pane'),
+                ('t4', 'terminal.kill', {'terminal': 't4'}, 'terminal')]:
+                self.assertEqual(self.request('POST', '/api/close', {'t': terminal}), (200, {'ok': True, 'closed': closed}))
+                self.assertEqual(app.call_args.args[:2], ('do', command))
+                self.assertEqual(json.loads(app.call_args.args[2]), args)
+            hc.assert_called_once_with('rm', 't4')
+            self.assertEqual(self.request('POST', '/api/close', {'t': 't99'}), (404, {'error': 'terminal not found'}))
+            for value in ('../t1', 'win-native/t1', None, 123):
+                self.assertEqual(self.request('POST', '/api/close', {'t': value})[0], 400)
+            self.runtime.spaces.set('ALIAS', str(self.root))
+            self.runtime.spaces.set('Synthetic', str(self.root))
+            self.runtime.spaces.set('Keep', str(self.root))
+            self.assertEqual(self.request('POST', '/api/space/close', {'space': 'aLiAs'}), (200, {'ok': True, 'closed_terminals': 3}))
+            self.assertEqual(json.loads(app.call_args.args[2]), {'id': 's1', 'confirmed': True})
+            self.assertEqual(self.runtime.spaces.data, {'Keep': str(self.root)})
+            self.assertEqual(SpaceStore(self.runtime.spaces.path).data, self.runtime.spaces.data)
+            self.assertEqual(self.request('POST', '/api/space/close', {'space': 'missing'})[0], 404)
+            for endpoint in ('close', 'space/close'):
+                self.assertEqual(self.request('POST', '/api/' + endpoint, token='secret')[0], 401)
+            self.assertEqual(self.request('POST', '/api/close', {'t': 't1'}, token='secret', auth='Bearer secret')[0], 200)
+        with patch.object(server, 'app_spaces', return_value=[{'tabs': [{'id': 'tab1', 'terminals': [{'terminal': 't1'}]}]}]), patch.object(server, 'app', return_value=(1, '', 'close failed')):
+            self.assertEqual(self.request('POST', '/api/close', {'t': 't1'}), (502, {'error': 'close failed'}))
+
     def test_register_activity_and_json_limits(self):
         self.assertEqual(self.request('POST', '/api/register', {'token': 'aa', 'env': 'production'})[0], 200)
         self.assertEqual(self.request('POST', '/api/activity', {'start_token': 'bb', 'env': 'development'})[0], 200)
@@ -117,7 +151,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(server.live_terminals(), [{'address': 't1'}])
 
     def test_remaining_routes_and_rpc_environment(self):
-        with patch.object(server, 'hc', return_value=(0, '\x1b[31mhello', '')) as hc:
+        with patch.object(server, 'live_terminals', return_value=[{'address': 't1'}]), patch.object(server, 'hc', return_value=(0, '\x1b[31mhello', '')) as hc:
             self.assertEqual(self.request('GET', '/api/read?t=t1'), (200, {'text': 'hello'}))
             self.assertEqual(self.request('POST', '/api/keys', {'t': 't1', 'key': 'enter'})[0], 200)
             self.assertEqual(self.request('POST', '/api/keys', {'t': 't1', 'key': 'bad'})[0], 400)

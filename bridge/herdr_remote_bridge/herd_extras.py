@@ -261,6 +261,17 @@ class SpaceStore:
             temp.write_text(json.dumps(self.data, indent=2), encoding='utf-8')
             os.replace(temp, self.path)
 
+    def remove(self, aliases):
+        names = {name.casefold() for name in aliases}
+        with self.lock:
+            remaining = {key: value for key, value in self.data.items() if key.casefold() not in names}
+            if remaining == self.data:
+                return
+            temp = self.path.with_suffix('.tmp')
+            temp.write_text(json.dumps(remaining, indent=2), encoding='utf-8')
+            os.replace(temp, self.path)
+            self.data = remaining
+
     def get(self, name):
         with self.lock:
             return next((cwd for key, cwd in self.data.items() if key.casefold() == name.casefold()), None)
