@@ -1,0 +1,16 @@
+# Local settings and secrets: never commit
+config.json
+herd-push.json
+herd-tokens.json
+herd-spaces.json
+herd-relay.json
+herd-paired.json
+pair-qr.png
+*.p8
+__pycache__/
+*.log
+
+# Python packaging output
+*.egg-info/
+dist/
+build/

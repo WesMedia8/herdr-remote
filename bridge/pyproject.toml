@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-remote-bridge"
+version = "0.1.0"
+description = "Tailscale bridge for Herdr Remote"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["httpx[http2]", "PyJWT[crypto]", "segno"]
+
+[project.scripts]
+herdr-remote-bridge = "herdr_remote_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["herdr_remote_bridge*"]
