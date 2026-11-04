@@ -258,9 +258,19 @@ def assistant_summary(messages):
     text = ' '.join(text.split())
     if not text:
         return None
-    if len(text) > 178:
-        prefix = text[:178]
-        if not text[178].isspace() and not prefix[-1].isspace():
+    return _finished_summary(text)
+
+
+def _finished_summary(text):
+    """Keep one sentence and at most 60 characters of notification detail."""
+    text = ' '.join(text.split())
+    boundary = re.search(r'[.!?:] ', text[12:])
+    if boundary:
+        end = 12 + boundary.start()
+        text = text[:end + (text[end] != ':')]
+    if len(text) > 60:
+        prefix = text[:59]
+        if not text[59].isspace() and not prefix[-1].isspace():
             prefix = prefix.rsplit(' ', 1)[0] if ' ' in prefix else ''
         text = prefix.rstrip() + '…'
     return text
@@ -316,6 +326,8 @@ class StatusWatcher(threading.Thread):
                             summary = self.summarize(terminal) or summary
                         except Exception:
                             pass
+                    if status != 'blocked':
+                        summary = _finished_summary(summary)
                     body = f"{friendly_name(terminal.get('agent'))} {'needs you' if status == 'blocked' else 'finished'}: {summary}"
                     payload = alert_payload(terminal.get('where') or 'Other', body, address,
                                             sum(t.get('status') == 'blocked' for t in terminals),

@@ -25,11 +25,22 @@ class SummaryTests(unittest.TestCase):
                          [{'role': 'assistant', 'text': '```'}]):
             self.assertIsNone(assistant_summary(messages))
 
+    def test_first_sentence(self):
+        for punctuation in ('.', '!', '?', ':'):
+            with self.subTest(punctuation=punctuation):
+                text = f'Built the page{punctuation} Tested it too.'
+                expected = 'Built the page' + (punctuation if punctuation != ':' else '')
+                self.assertEqual(assistant_summary([{'role': 'assistant', 'text': text}]), expected)
+        self.assertEqual(assistant_summary([{'role': 'assistant', 'text':
+            'OK. Built the page. Tested it too.'}]), 'OK. Built the page.')
+
     def test_truncation(self):
         self.assertEqual(assistant_summary([{'role': 'assistant', 'text': 'word ' * 40}]),
-                         ' '.join(['word'] * 35) + '…')
-        text = 'a' * 178
+                         ' '.join(['word'] * 12) + '…')
+        text = 'a' * 60
         self.assertEqual(assistant_summary([{'role': 'assistant', 'text': text}]), text)
+        self.assertEqual(assistant_summary([{'role': 'assistant', 'text': 'Built the page'}]),
+                         'Built the page')
 
     def test_watcher(self):
         with tempfile.TemporaryDirectory() as directory:

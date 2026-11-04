@@ -122,6 +122,28 @@ class HerdTests(unittest.TestCase):
         self.assertNotIn('category', alerts[0][2]['aps'])
         self.assertIn('finished', alerts[0][2]['aps']['alert']['body'])
 
+    def test_watcher_preview_body(self):
+        self.store.add('ab', 'development')
+        preview = 'word ' * 20 + '. Another sentence.'
+        for status, summarize, expected in (
+            ('done', None, ' '.join(['word'] * 12) + '…'),
+            ('done', lambda terminal: None, ' '.join(['word'] * 12) + '…'),
+            ('done', None, 'Built the page.'),
+            ('blocked', None, preview),
+        ):
+            with self.subTest(status=status, summarize=summarize, expected=expected):
+                watcher = StatusWatcher(lambda: [], None, self.store, 'PC', summarize=summarize)
+                self.addCleanup(watcher.executor.shutdown)
+                text = 'Built the page. Tested it too.' if expected == 'Built the page.' else preview
+                terminal = dict(address='t1', agent='codex', status='working', preview=text)
+                watcher.poll([terminal], 0)
+                terminal['status'] = status
+                watcher.poll([terminal], 2)
+                jobs = watcher.poll([terminal], 6)
+                body = next(j[2]['aps']['alert']['body'] for j in jobs if j[0] == 'alert')
+                label = 'needs you' if status == 'blocked' else 'finished'
+                self.assertEqual(body, f'Codex {label}: {expected}')
+
     def test_watcher_finished_transitions(self):
         cases = (
             ('working to idle', 'working', [(2, 'idle'), (5, 'idle'), (6, 'idle'), (40, 'idle')], 1),
