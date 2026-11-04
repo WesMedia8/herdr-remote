@@ -275,14 +275,19 @@ class StatusWatcher(threading.Thread):
             if address not in self.previous:
                 self.previous[address] = status
             old = self.previous[address]
-            if status == old:
+            # Viewing a finished pane can flip done to idle; debounce them together.
+            group = 'finished' if status in ('idle', 'done') else status
+            old_group = 'finished' if old in ('idle', 'done') else old
+            if group == old_group:
+                self.previous[address] = status
                 self.pending.pop(address, None)
-            elif address not in self.pending or self.pending[address][0] != status:
-                self.pending[address] = (status, now)
+            elif address not in self.pending or self.pending[address][0] != group:
+                self.pending[address] = (group, now)
             elif now - self.pending[address][1] >= 4:
                 self.previous[address] = status
                 self.pending.pop(address)
-                if status in ('blocked', 'done') and now - self.last_alert.get(address, -float('inf')) >= 30:
+                finished = group == 'finished' and old in ('working', 'blocked')
+                if (status == 'blocked' or finished) and now - self.last_alert.get(address, -float('inf')) >= 30:
                     self.last_alert[address] = now
                     body = f"{friendly_name(terminal.get('agent'))} {'needs you' if status == 'blocked' else 'finished'}: {terminal.get('preview') or ''}"
                     payload = alert_payload(terminal.get('where') or 'Other', body, address,

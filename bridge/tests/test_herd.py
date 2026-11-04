@@ -122,6 +122,36 @@ class HerdTests(unittest.TestCase):
         self.assertNotIn('category', alerts[0][2]['aps'])
         self.assertIn('finished', alerts[0][2]['aps']['alert']['body'])
 
+    def test_watcher_finished_transitions(self):
+        cases = (
+            ('working to idle', 'working', [(2, 'idle'), (5, 'idle'), (6, 'idle'), (40, 'idle')], 1),
+            ('finished flicker', 'working', [(2, 'done'), (4, 'idle'), (6, 'idle'), (40, 'done')], 1),
+            ('idle to done', 'idle', [(2, 'done'), (6, 'done'), (40, 'done')], 0),
+            ('unknown to idle', 'unknown', [(2, 'idle'), (6, 'idle'), (40, 'idle')], 0),
+            ('initial idle', 'idle', [(2, 'idle'), (6, 'idle')], 0),
+        )
+        self.store.add('ab', 'development')
+        for name, initial, polls, expected in cases:
+            with self.subTest(name=name):
+                watcher = StatusWatcher(lambda: [], None, self.store, 'PC')
+                self.addCleanup(watcher.executor.shutdown)
+                terminal = {'address': 't1', 'agent': 'codex', 'status': initial, 'preview': 'Ready'}
+                self.assertEqual(watcher.poll([terminal], 0), [])
+                alerts = []
+                for now, status in polls:
+                    terminal['status'] = status
+                    jobs = [j for j in watcher.poll([terminal], now) if j[0] == 'alert']
+                    if now < 6:
+                        self.assertEqual(jobs, [])
+                    if expected and now == 6:
+                        self.assertEqual(len(jobs), 1)
+                    alerts.extend(jobs)
+                self.assertEqual(len(alerts), expected)
+                self.assertEqual(watcher.previous['t1'], polls[-1][1])
+                for _, _, payload in alerts:
+                    self.assertEqual(payload['aps']['alert']['body'], 'Codex finished: Ready')
+                    self.assertNotIn('category', payload['aps'])
+
     def test_start_once_and_machine_filter(self):
         self.store.add('ab', 'development', 'starts')
         self.store.add('cd', 'development', 'activities', 'Other')
