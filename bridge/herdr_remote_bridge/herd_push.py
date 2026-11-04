@@ -246,13 +246,34 @@ def content_state(terminals, now=None):
             'topAddress': top['address'] if top else None, 'updatedAt': to_apple_date(time.time() if now is None else now)}
 
 
+def assistant_summary(messages):
+    """Return a compact plain-text summary of the last non-empty assistant message."""
+    text = next((m.get('text') for m in reversed(messages)
+                 if m.get('role') == 'assistant' and (m.get('text') or '').strip()), None)
+    if text is None:
+        return None
+    text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+    text = re.sub(r'^\s*[#*>-]+\s*', '', text, flags=re.MULTILINE)
+    text = text.replace('`', '').replace('**', '')
+    text = ' '.join(text.split())
+    if not text:
+        return None
+    if len(text) > 178:
+        prefix = text[:178]
+        if not text[178].isspace() and not prefix[-1].isspace():
+            prefix = prefix.rsplit(' ', 1)[0] if ' ' in prefix else ''
+        text = prefix.rstrip() + '…'
+    return text
+
+
 class StatusWatcher(threading.Thread):
-    def __init__(self, get_terminals, client, store, machine, poll_interval=2):
+    def __init__(self, get_terminals, client, store, machine, poll_interval=2, summarize=None):
         super().__init__(name='herd-status', daemon=True)
         self.get_terminals, self.client, self.store, self.machine = get_terminals, client, store, machine
         if getattr(client, 'is_relay', False):
             self.store = RelayWatcherStore(machine)
             client.machine = machine
+        self.summarize = summarize
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
         self.previous = None
@@ -289,7 +310,13 @@ class StatusWatcher(threading.Thread):
                 finished = group == 'finished' and old in ('working', 'blocked')
                 if (status == 'blocked' or finished) and now - self.last_alert.get(address, -float('inf')) >= 30:
                     self.last_alert[address] = now
-                    body = f"{friendly_name(terminal.get('agent'))} {'needs you' if status == 'blocked' else 'finished'}: {terminal.get('preview') or ''}"
+                    summary = terminal.get('preview') or ''
+                    if finished and self.summarize is not None:
+                        try:
+                            summary = self.summarize(terminal) or summary
+                        except Exception:
+                            pass
+                    body = f"{friendly_name(terminal.get('agent'))} {'needs you' if status == 'blocked' else 'finished'}: {summary}"
                     payload = alert_payload(terminal.get('where') or 'Other', body, address,
                                             sum(t.get('status') == 'blocked' for t in terminals),
                                             'AGENT_BLOCKED' if status == 'blocked' else None)

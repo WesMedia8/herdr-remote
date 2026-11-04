@@ -25,9 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .herd_push import (PushConfig, TokenStore, APNsClient, RelayConfig, RelayClient,
-                        StatusWatcher, handle_register, handle_activity, handle_test_push)
+                        StatusWatcher, assistant_summary, handle_register, handle_activity, handle_test_push)
 from .herd_extras import SpaceStore, handle_chat, handle_upload, handle_dirs, handle_space
-from . import sessions
+from . import sessions, herd_extras
 
 
 def config_path():
@@ -293,6 +293,37 @@ def chat_source(t, term):
     return {"session_file": str(path), "cwd": term.get("cwd"), "home": home} if path else None
 
 
+def transcript_source(term, terminals):
+    """Share /api/chat's explicit, process-mapped, and sole-cwd lookup order.
+
+    The boolean indicates a process mapping whose missing file means empty chat.
+    """
+    if not term.get('session_file') and not term.get('session_id'):
+        try:
+            source = chat_source(term['address'], term)
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+            source = None
+        if source:
+            return source, True
+        if not term.get('cwd') or sum(x.get('cwd') == term.get('cwd') for x in terminals) > 1:
+            return None, False
+    return {key: term.get(key) for key in ('cwd', 'session_file', 'session_id')} | {'home': agent_home()}, False
+
+
+def terminal_summary(term):
+    """Read the terminal's last assistant message when its transcript is available."""
+    if term.get('agent') not in ('claude-code', 'codex'):
+        return None
+    try:
+        source, _ = transcript_source(term, live_terminals())
+        if source is None:
+            return None
+        path = herd_extras.find_transcript(term.get('agent'), **source)
+        return assistant_summary(herd_extras.parse_transcript(path)) if path else None
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def agents_snapshot():
     code, out, err = hc("ls", "--json")
     if code:
@@ -315,7 +346,7 @@ class Runtime:
             self.client = RelayClient(RelayConfig.load(self.directory), machine=self.machine)
         elif (self.directory / 'herd-push.json').exists():
             self.client = APNsClient(PushConfig.load(self.directory), self.tokens)
-        self.watcher = (StatusWatcher(get_terminals or live_terminals, self.client, self.tokens, self.machine)
+        self.watcher = (StatusWatcher(get_terminals or live_terminals, self.client, self.tokens, self.machine, summarize=terminal_summary)
                         if self.client else None)
         self._paired = None
         self._relay_mtime = self._relay_stamp()
@@ -344,7 +375,7 @@ class Runtime:
                       if (self.directory / 'herd-push.json').exists() else None)
             self._close_push()
             self.client = client
-            self.watcher = (StatusWatcher(self._get_terminals, client, self.tokens, self.machine)
+            self.watcher = (StatusWatcher(self._get_terminals, client, self.tokens, self.machine, summarize=terminal_summary)
                             if client else None)
             self._relay_mtime = stamp
             if self._started and self.watcher:
@@ -481,23 +512,13 @@ class Handler(BaseHTTPRequestHandler):
             term = next((x for x in terminals if x['address'] == t), None)
             if not term:
                 return self._json(404, {'error': 'terminal not found'})
-            if not term.get('session_file') and not term.get('session_id'):
-                try:
-                    source = chat_source(t, term)
-                except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
-                    source = None
-                if source:
-                    status, result = handle_chat(query, agent=term.get('agent'), cwd=source.get('cwd'),
-                                                 session_file=source.get('session_file'),
-                                                 session_id=source.get('session_id'), home=source['home'])
-                    if status == 404:  # mapped, but nothing said yet: Claude writes the file on the first message
-                        status, result = 200, {'messages': []}
-                    return self._json(status, result)
-                if not term.get('cwd') or sum(x.get('cwd') == term.get('cwd') for x in terminals) > 1:
-                    return self._json(400, {'error': 'terminal session mapping required'})
-            return self._json(*handle_chat(query, agent=term.get('agent'), cwd=term.get('cwd'),
-                                          session_file=term.get('session_file'), session_id=term.get('session_id'),
-                                          home=agent_home()))
+            source, mapped = transcript_source(term, terminals)
+            if source is None:
+                return self._json(400, {'error': 'terminal session mapping required'})
+            status, result = handle_chat(query, agent=term.get('agent'), **source)
+            if mapped and status == 404:
+                status, result = 200, {'messages': []}
+            return self._json(status, result)
         if url.path == "/api/read":
             t = parse_qs(url.query).get("t", [""])[0]
             if not ADDRESS.fullmatch(t):
